@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Invoice Batch Extractor</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 2rem; }
+        .container { max-width: 1400px; margin: auto; }
+        input, button { margin: 10px 5px; padding: 8px 16px; }
+        table { border-collapse: collapse; width: 100%; margin-top: 20px; font-size: 0.9em; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .confidence { font-size: 0.85em; }
+        .error { color: red; }
+        .export-btn { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+        .export-btn:hover { background-color: #45a049; }
+        .file-section { margin-bottom: 30px; border-bottom: 2px solid #ccc; padding-bottom: 20px; }
+        .file-title { font-weight: bold; font-size: 1.2em; margin-bottom: 10px; }
+        .conf-high { color: green; font-weight: bold; }
+        .conf-medium { color: #FF8C00; font-weight: bold; }
+        .conf-low { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Invoice Data Extractor</h1>
+        <p>Upload multiple PDF invoices. Extracts: Supplier, Invoice ID, Date, Payment Term, Line Items (with discount/tax), and confidence scores.</p>
+
+        <input type="file" id="fileInput" multiple accept=".pdf,application/pdf">
+        <button onclick="uploadFiles()">Extract Data</button>
+        <button id="exportBtn" class="export-btn" onclick="exportToExcel()" style="display:none;">Download Excel Report</button>
+        <div id="status"></div>
+        <div id="results"></div>
+    </div>
+
+    <script>
+        let extractionResults = null;
+
+        async function uploadFiles() {
+            const files = document.getElementById('fileInput').files;
+            if (files.length === 0) {
+                alert('Please select at least one PDF file.');
+                return;
+            }
+
+            const statusDiv = document.getElementById('status');
+            const resultsDiv = document.getElementById('results');
+            const exportBtn = document.getElementById('exportBtn');
+            statusDiv.textContent = 'Processing...';
+            resultsDiv.innerHTML = '';
+            exportBtn.style.display = 'none';
+
+            const formData = new FormData();
+            for (let file of files) {
+                formData.append('files', file);
+            }
+
+            try {
+                const response = await fetch('/extract', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Request failed');
+                }
+
+                extractionResults = data;
+                displayResults(data.results);
+                exportBtn.style.display = 'inline-block';
+                statusDiv.textContent = `Completed processing ${files.length} file(s).`;
+            } catch (error) {
+                statusDiv.innerHTML = `<span class="error">Error: ${error.message}</span>`;
+                console.error(error);
+            }
+        }
+
+        function getConfidenceClass(conf) {
+            if (conf === null || conf === undefined) return '';
+            if (conf >= 95) return 'conf-high';
+            if (conf >= 90) return 'conf-medium';
+            return 'conf-low';
+        }
+
+        function displayResults(results) {
+            const resultsDiv = document.getElementById('results');
+            let html = '';
+
+            results.forEach((result, idx) => {
+                html += `<div class="file-section">`;
+                html += `<div class="file-title">📄 ${result.file}</div>`;
+                if (result.error) {
+                    html += `<p class="error">Error: ${result.error}</p>`;
+                } else {
+                    const data = result.extracted_data;
+                    const avgConfValue = result.average_confidence;
+                    const avgConfDisplay = avgConfValue ? avgConfValue.toFixed(2) : 'N/A';
+                    const avgConfClass = getConfidenceClass(avgConfValue);
+                    html += `<p><strong>Average Confidence:</strong> <span class="${avgConfClass}">${avgConfDisplay}%</span></p>`;
+
+                    const supConf = result.field_confidences.supplier_name;
+                    const supClass = getConfidenceClass(supConf);
+                    const invConf = result.field_confidences.invoice_id;
+                    const invClass = getConfidenceClass(invConf);
+                    const dateConf = result.field_confidences.invoice_date;
+                    const dateClass = getConfidenceClass(dateConf);
+                    const payConf = result.field_confidences.payment_term;
+                    const payClass = getConfidenceClass(payConf);
+
+                    html += `<table>
+                        <tr><th>Field</th><th>Value</th><th>Confidence</th></tr>
+                        <tr>
+                            <td>Supplier Name</td>
+                            <td>${data.supplier_name || ''}</td>
+                            <td class="confidence"><span class="${supClass}">${supConf || 'N/A'}</span></td>
+                        </tr>
+                        <tr>
+                            <td>Invoice ID</td>
+                            <td>${data.invoice_id || ''}</td>
+                            <td class="confidence"><span class="${invClass}">${invConf || 'N/A'}</span></td>
+                        </tr>
+                        <tr>
+                            <td>Invoice Date</td>
+                            <td>${data.invoice_date || ''}</td>
+                            <td class="confidence"><span class="${dateClass}">${dateConf || 'N/A'}</span></td>
+                        </tr>
+                        <tr>
+                            <td>Payment Term</td>
+                            <td>${data.payment_term || ''}</td>
+                            <td class="confidence"><span class="${payClass}">${payConf || 'N/A'}</span></td>
+                        </tr>
+                    </table>`;
+
+                    if (data.line_items && data.line_items.length > 0) {
+                        html += `<h4>Line Items</h4>`;
+                        html += `<table>
+                            <tr>
+                                <th>Description</th>
+                                <th>Qty</th>
+                                <th>Unit Price</th>
+                                <th>Discount</th>
+                                <th>Tax</th>
+                                <th>Confidence (Desc/Qty/Price/Disc/Tax)</th>
+                            </tr>`;
+                        data.line_items.forEach((item, i) => {
+                            const conf = result.line_items_confidences[i] || {};
+                            const descConf = conf.description;
+                            const descClass = getConfidenceClass(descConf);
+                            const qtyConf = conf.quantity;
+                            const qtyClass = getConfidenceClass(qtyConf);
+                            const priceConf = conf.unit_price;
+                            const priceClass = getConfidenceClass(priceConf);
+                            const discConf = conf.discount;
+                            const discClass = getConfidenceClass(discConf);
+                            const taxConf = conf.tax;
+                            const taxClass = getConfidenceClass(taxConf);
+
+                            html += `<tr>
+                                <td>${item.description || ''}</td>
+                                <td>${item.quantity || ''}</td>
+                                <td>${item.unit_price || ''}</td>
+                                <td>${item.discount || ''}</td>
+                                <td>${item.tax || ''}</td>
+                                <td class="confidence">
+                                    <span class="${descClass}">${descConf || 'N/A'}</span> / 
+                                    <span class="${qtyClass}">${qtyConf || 'N/A'}</span> / 
+                                    <span class="${priceClass}">${priceConf || 'N/A'}</span> / 
+                                    <span class="${discClass}">${discConf || 'N/A'}</span> / 
+                                    <span class="${taxClass}">${taxConf || 'N/A'}</span>
+                                </td>
+                            </tr>`;
+                        });
+                        html += `</table>`;
+                    }
+                }
+                html += `</div>`;
+            });
+
+            resultsDiv.innerHTML = html;
+        }
+
+        async function exportToExcel() {
+            if (!extractionResults) {
+                alert('No extraction results to export.');
+                return;
+            }
+
+            const exportBtn = document.getElementById('exportBtn');
+            exportBtn.disabled = true;
+            exportBtn.textContent = 'Generating Excel...';
+
+            try {
+                const response = await fetch('/export', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(extractionResults)
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.error || 'Export failed');
+                }
+
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'extracted_invoices.xlsx';
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+            } catch (error) {
+                alert('Export error: ' + error.message);
+            } finally {
+                exportBtn.disabled = false;
+                exportBtn.textContent = 'Download Excel Report';
+            }
+        }
+    </script>
+</body>
+</html>
