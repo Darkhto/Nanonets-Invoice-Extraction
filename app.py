@@ -260,149 +260,178 @@ def extract_invoices():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/export', methods=['POST'])
-def export_excel():
+@app.route('/extract', methods=['POST'])
+def extract_invoices():
     try:
-        data = request.get_json(silent=True)  # FIXED: 'silent' not 'silent'
-        if data and 'results' in data:
-            results = data['results']
-        elif 'extraction_results' in session:
-            results = json.loads(session['extraction_results'])
-        else:
-            return jsonify({"error": "No extraction results available"}), 400
+        if 'files' not in request.files:
+            return jsonify({"error": "No files uploaded"}), 400
 
-        # Use absolute path based on this file's location
-        template_path = os.path.join(os.path.dirname(__file__), 'purchase_bills.xlsx')
-        if not os.path.exists(template_path):
-            logger.error(f"Template file not found at {template_path}")
-            return jsonify({"error": "Template file purchase_bills.xlsx not found on server"}), 500
+        files = request.files.getlist('files')
+        if not files:
+            return jsonify({"error": "Empty file list"}), 400
 
-        wb = openpyxl.load_workbook(template_path)
-        ws = wb.active
+        multipart_data = {
+            'output_format': 'json',
+            'json_options': json.dumps(EXTRACTION_SCHEMA),
+            'include_metadata': 'confidence_score'
+        }
 
-        start_row = 31
-        current_row = start_row
+        file_tuples = []
+        for f in files:
+            if f.filename == '':
+                continue
+            filename = secure_filename(f.filename)
+            file_tuples.append(('files', (filename, f.read(), f.content_type)))
 
-        yellow_fill_conf = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
-        red_fill_conf = PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid')
-        orange_fill_cod = PatternFill(start_color='FFA500', end_color='FFA500', fill_type='solid')
+        if not file_tuples:
+            return jsonify({"error": "No valid files"}), 400
 
-        def get_fill_for_confidence(conf):
-            if conf is None:
-                return None
-            if conf < 90:
-                return red_fill_conf
-            elif 90 <= conf < 95:
-                return yellow_fill_conf
-            else:
-                return None
+        headers = {"Authorization": f"Bearer {NANONETS_API_KEY}"}
 
-        def safe_set_fill(cell, fill):
-            if fill is not None:
-                try:
-                    cell.fill = fill
-                except Exception as e:
-                    logger.warning(f"Could not set fill on {cell.coordinate}: {e}")
+        # Submit batch job with a timeout
+        batch_resp = requests.post(
+            BATCH_ENDPOINT,
+            headers=headers,
+            files=file_tuples,
+            data=multipart_data,
+            timeout=30  # 30 seconds for submission
+        )
+        batch_resp.raise_for_status()
+        batch_data = batch_resp.json()
+        logger.info(f"Batch submitted: {batch_data.get('batch_id')}")
 
-        for invoice in results:
-            extracted = invoice.get('extracted_data', {})
-            if not extracted:
+        records = batch_data.get("records", [])
+        if not records:
+            return jsonify({"error": "No records in batch response"}), 500
+
+        formatted_results = []
+        max_poll_attempts = 30
+        poll_interval = 2
+
+        for idx, record in enumerate(records):
+            record_id = record.get("record_id")
+            original_filename = files[idx].filename if idx < len(files) else record.get("filename", f"file_{idx}.pdf")
+
+            if not record_id:
+                formatted_results.append({
+                    "file": original_filename,
+                    "error": "No record_id returned",
+                    "extracted_data": None,
+                    "confidence": None
+                })
                 continue
 
-            supplier = extracted.get('supplier_name', '')
-            invoice_date = extracted.get('invoice_date', '')
-            invoice_id = extracted.get('invoice_id', '')
-            line_items = extracted.get('line_items', [])
-
-            field_conf = invoice.get('field_confidences', {})
-            line_items_conf = invoice.get('line_items_confidences', [])
-
-            raw_payment_term = extracted.get('payment_term', '')
-            payment_term, cod_highlight = standardize_payment_term(raw_payment_term)
-
-            first_item = True
-            for i, item in enumerate(line_items):
-                if first_item:
-                    cell_supplier = ws.cell(row=current_row, column=2)
-                    cell_supplier.value = supplier
-                    safe_set_fill(cell_supplier, get_fill_for_confidence(field_conf.get('supplier_name')))
-
-                    cell_invoice_id = ws.cell(row=current_row, column=3)
-                    cell_invoice_id.value = invoice_id
-                    safe_set_fill(cell_invoice_id, get_fill_for_confidence(field_conf.get('invoice_id')))
-
-                    cell_date = ws.cell(row=current_row, column=5)
-                    cell_date.value = invoice_date
-                    safe_set_fill(cell_date, get_fill_for_confidence(field_conf.get('invoice_date')))
-
-                    cell_payment = ws.cell(row=current_row, column=6)
-                    cell_payment.value = payment_term
-                    if cod_highlight:
-                        safe_set_fill(cell_payment, orange_fill_cod)
+            result_data = None
+            for attempt in range(max_poll_attempts):
+                try:
+                    poll_resp = requests.get(
+                        RESULTS_ENDPOINT.format(record_id),
+                        headers=headers,
+                        timeout=10  # each poll request times out after 10 seconds
+                    )
+                    poll_resp.raise_for_status()
+                    poll_data = poll_resp.json()
+                    status = poll_data.get("status")
+                    if status == "completed":
+                        result_data = poll_data
+                        break
+                    elif status == "failed":
+                        formatted_results.append({
+                            "file": original_filename,
+                            "error": poll_data.get("message", "Processing failed"),
+                            "extracted_data": None,
+                            "confidence": None
+                        })
+                        break
                     else:
-                        safe_set_fill(cell_payment, get_fill_for_confidence(field_conf.get('payment_term')))
+                        time.sleep(poll_interval)
+                except requests.exceptions.Timeout:
+                    logger.warning(f"Polling timeout for record {record_id}, attempt {attempt+1}")
+                    continue
+                except Exception as e:
+                    formatted_results.append({
+                        "file": original_filename,
+                        "error": f"Polling error: {str(e)}",
+                        "extracted_data": None,
+                        "confidence": None
+                    })
+                    break
+            else:
+                # Loop completed without break -> timeout
+                formatted_results.append({
+                    "file": original_filename,
+                    "error": "Polling timed out after 60 seconds",
+                    "extracted_data": None,
+                    "confidence": None
+                })
+                continue
 
-                    ws.cell(row=current_row, column=7).value = ''
-                    ws.cell(row=current_row, column=8).value = 'MYR'
-                    ws.cell(row=current_row, column=10).value = 'Non-Interco, Warehouse Picorp'
+            if result_data is None:
+                continue
 
-                    avg_conf = invoice.get('average_confidence')
-                    cell_avg = ws.cell(row=current_row, column=23)  # Column W (23rd)
-                    cell_avg.value = avg_conf
-                    safe_set_fill(cell_avg, get_fill_for_confidence(avg_conf))
+            # Extract data and confidence
+            json_result = result_data.get("result", {}).get("json", {})
+            extracted = json_result.get("content", {})
+            metadata = json_result.get("metadata", {})
+            confidence_scores = metadata.get("confidence_score", {})
 
-                    first_item = False
+            # Standardize date format
+            extracted['invoice_date'] = standardize_date(extracted.get('invoice_date'))
 
-                item_conf = line_items_conf[i] if i < len(line_items_conf) else {}
+            field_confidences = {}
+            for field in ["supplier_name", "invoice_id", "invoice_date", "payment_term"]:
+                field_confidences[field] = confidence_scores.get(field)
 
-                cell_desc = ws.cell(row=current_row, column=14)
-                cell_desc.value = item.get('description', '')
-                safe_set_fill(cell_desc, get_fill_for_confidence(item_conf.get('description')))
+            line_items_conf = []
+            line_items = extracted.get("line_items", [])
+            line_items_conf_raw = confidence_scores.get("line_items", {})
+            ref_keys = list(line_items_conf_raw.keys())
+            for i, item in enumerate(line_items):
+                item_conf = {}
+                if i < len(ref_keys):
+                    ref_key = ref_keys[i]
+                    item_conf_data = line_items_conf_raw.get(ref_key, {})
+                    for subfield in ["description", "quantity", "unit_price", "discount", "tax"]:
+                        item_conf[subfield] = item_conf_data.get(subfield)
+                else:
+                    for subfield in ["description", "quantity", "unit_price", "discount", "tax"]:
+                        item_conf[subfield] = None
+                line_items_conf.append(item_conf)
 
-                qty = item.get('quantity')
-                if qty is not None:
-                    cell_qty = ws.cell(row=current_row, column=15)
-                    cell_qty.value = qty
-                    safe_set_fill(cell_qty, get_fill_for_confidence(item_conf.get('quantity')))
+            # Calculate average confidence
+            all_confidences = list(field_confidences.values())
+            for ic in line_items_conf:
+                all_confidences.extend(ic.values())
+            valid_confs = [c for c in all_confidences if c is not None]
+            avg_confidence = sum(valid_confs) / len(valid_confs) if valid_confs else None
 
-                unit_price = item.get('unit_price')
-                if unit_price is not None:
-                    cell_price = ws.cell(row=current_row, column=18)
-                    cell_price.value = unit_price
-                    safe_set_fill(cell_price, get_fill_for_confidence(item_conf.get('unit_price')))
+            formatted_results.append({
+                "file": original_filename,
+                "extracted_data": extracted,
+                "field_confidences": field_confidences,
+                "line_items_confidences": line_items_conf,
+                "average_confidence": avg_confidence
+            })
 
-                discount = item.get('discount')
-                if discount is not None:
-                    cell_disc = ws.cell(row=current_row, column=19)
-                    cell_disc.value = discount
-                    safe_set_fill(cell_disc, get_fill_for_confidence(item_conf.get('discount')))
+        session['extraction_results'] = json.dumps(formatted_results)
+        return jsonify({"results": formatted_results})
 
-                tax = item.get('tax')
-                if tax is not None:
-                    cell_tax = ws.cell(row=current_row, column=20)
-                    cell_tax.value = tax
-                    safe_set_fill(cell_tax, get_fill_for_confidence(item_conf.get('tax')))
-
-                current_row += 1
-
-        output = io.BytesIO()
-        wb.save(output)
-        output.seek(0)
-
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name='extracted_invoices.xlsx'
-        )
-
+    except requests.exceptions.Timeout:
+        logger.error("Batch submission or polling timed out")
+        return jsonify({"error": "Request timed out. Please try with fewer files or check your connection."}), 504
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error from Nanonets: {e.response.text if e.response else str(e)}")
+        return jsonify({"error": f"API error: {str(e)}"}), 500
     except Exception as e:
-        logger.error(f"Export failed: {e}", exc_info=True)
-        return jsonify({"error": f"Export failed: {str(e)}"}), 500
+        logger.error(f"Extraction failed: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 @app.errorhandler(Exception)
 def handle_exception(e):
     logger.error(f"Unhandled exception: {e}", exc_info=True)
-    return jsonify({"error": str(e), "type": type(e).__name__}), 500
+    response = jsonify({"error": "Internal server error", "details": str(e)})
+    response.status_code = 500
+    return response
 
 # ------------------------------------------------------------
 # Main Entry Point
