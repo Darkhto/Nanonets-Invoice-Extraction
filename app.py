@@ -15,7 +15,7 @@ app = Flask(__name__)
 app.secret_key = 'weibfewb21712897'
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB limit
 
-NANONETS_API_KEY = "b958302e-6c0a-401b-8bb3-b25083fbf7ae"
+NANONETS_API_KEY = os.environ.get('NANONETS_API_KEY')
 BATCH_ENDPOINT = "https://extraction-api.nanonets.com/api/v1/extract/batch"
 RESULTS_ENDPOINT = "https://extraction-api.nanonets.com/api/v1/extract/results/{}"
 
