@@ -117,112 +117,58 @@ def extract_invoices():
         if not files:
             return jsonify({"error": "Empty file list"}), 400
 
-        multipart_data = {
-            'output_format': 'json',
-            'json_options': json.dumps(EXTRACTION_SCHEMA),
-            'include_metadata': 'confidence_score'
-        }
+        headers = {"Authorization": f"Bearer {NANONETS_API_KEY}"}
+        sync_url = "https://extraction-api.nanonets.com/api/v1/extract/sync"
 
-        file_tuples = []
+        formatted_results = []
+
         for f in files:
             if f.filename == '':
                 continue
+
             filename = secure_filename(f.filename)
-            file_tuples.append(('files', (filename, f.read(), f.content_type)))
 
-        if not file_tuples:
-            return jsonify({"error": "No valid files"}), 400
+            # Prepare the multipart data for this single file
+            multipart_data = {
+                'output_format': 'json',
+                'json_options': json.dumps(EXTRACTION_SCHEMA),
+                'include_metadata': 'confidence_score'
+            }
 
-        headers = {"Authorization": f"Bearer {NANONETS_API_KEY}"}
-
-        # Submit batch job with a timeout
-        batch_resp = requests.post(
-            BATCH_ENDPOINT,
-            headers=headers,
-            files=file_tuples,
-            data=multipart_data,
-            timeout=30  # 30 seconds for submission
-        )
-        batch_resp.raise_for_status()
-        batch_data = batch_resp.json()
-        logger.info(f"Batch submitted: {batch_data.get('batch_id')}")
-
-        records = batch_data.get("records", [])
-        if not records:
-            return jsonify({"error": "No records in batch response"}), 500
-
-        formatted_results = []
-        max_poll_attempts = 30
-        poll_interval = 2
-
-        for idx, record in enumerate(records):
-            record_id = record.get("record_id")
-            original_filename = files[idx].filename if idx < len(files) else record.get("filename", f"file_{idx}.pdf")
-
-            if not record_id:
+            try:
+                resp = requests.post(
+                    sync_url,
+                    headers=headers,
+                    files={'file': (filename, f.read(), f.content_type)},
+                    data=multipart_data,
+                    timeout=60  # generous timeout for a single file
+                )
+                resp.raise_for_status()
+                result_data = resp.json()
+            except requests.exceptions.Timeout:
                 formatted_results.append({
-                    "file": original_filename,
-                    "error": "No record_id returned",
+                    "file": filename,
+                    "error": "Request timed out",
+                    "extracted_data": None,
+                    "confidence": None
+                })
+                continue
+            except Exception as e:
+                formatted_results.append({
+                    "file": filename,
+                    "error": f"API error: {str(e)}",
                     "extracted_data": None,
                     "confidence": None
                 })
                 continue
 
-            result_data = None
-            for attempt in range(max_poll_attempts):
-                try:
-                    poll_resp = requests.get(
-                        RESULTS_ENDPOINT.format(record_id),
-                        headers=headers,
-                        timeout=10  # each poll request times out after 10 seconds
-                    )
-                    poll_resp.raise_for_status()
-                    poll_data = poll_resp.json()
-                    status = poll_data.get("status")
-                    if status == "completed":
-                        result_data = poll_data
-                        break
-                    elif status == "failed":
-                        formatted_results.append({
-                            "file": original_filename,
-                            "error": poll_data.get("message", "Processing failed"),
-                            "extracted_data": None,
-                            "confidence": None
-                        })
-                        break
-                    else:
-                        time.sleep(poll_interval)
-                except requests.exceptions.Timeout:
-                    logger.warning(f"Polling timeout for record {record_id}, attempt {attempt+1}")
-                    continue
-                except Exception as e:
-                    formatted_results.append({
-                        "file": original_filename,
-                        "error": f"Polling error: {str(e)}",
-                        "extracted_data": None,
-                        "confidence": None
-                    })
-                    break
-            else:
-                # Loop completed without break -> timeout
-                formatted_results.append({
-                    "file": original_filename,
-                    "error": "Polling timed out after 60 seconds",
-                    "extracted_data": None,
-                    "confidence": None
-                })
-                continue
-
-            if result_data is None:
-                continue
-
-            # Extract data and confidence
+            # Extract the content and metadata (same as before)
             json_result = result_data.get("result", {}).get("json", {})
             extracted = json_result.get("content", {})
             metadata = json_result.get("metadata", {})
             confidence_scores = metadata.get("confidence_score", {})
 
-            # Standardize date format
+            # Standardize date
             extracted['invoice_date'] = standardize_date(extracted.get('invoice_date'))
 
             field_confidences = {}
@@ -245,7 +191,6 @@ def extract_invoices():
                         item_conf[subfield] = None
                 line_items_conf.append(item_conf)
 
-            # Calculate average confidence
             all_confidences = list(field_confidences.values())
             for ic in line_items_conf:
                 all_confidences.extend(ic.values())
@@ -253,7 +198,7 @@ def extract_invoices():
             avg_confidence = sum(valid_confs) / len(valid_confs) if valid_confs else None
 
             formatted_results.append({
-                "file": original_filename,
+                "file": filename,
                 "extracted_data": extracted,
                 "field_confidences": field_confidences,
                 "line_items_confidences": line_items_conf,
@@ -263,12 +208,6 @@ def extract_invoices():
         session['extraction_results'] = json.dumps(formatted_results)
         return jsonify({"results": formatted_results})
 
-    except requests.exceptions.Timeout:
-        logger.error("Batch submission or polling timed out")
-        return jsonify({"error": "Request timed out. Please try with fewer files or check your connection."}), 504
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error from Nanonets: {e.response.text if e.response else str(e)}")
-        return jsonify({"error": f"API error: {str(e)}"}), 500
     except Exception as e:
         logger.error(f"Extraction failed: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
