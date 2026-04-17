@@ -393,10 +393,10 @@ def export_excel():
                     ws.cell(row=current_row, column=8).value = 'MYR'
                     ws.cell(row=current_row, column=10).value = 'Non-Interco, Warehouse Picorp'
 
-                    avg_conf = invoice.get('average_confidence')
+                    """avg_conf = invoice.get('average_confidence')
                     cell_avg = ws.cell(row=current_row, column=23)
                     cell_avg.value = avg_conf
-                    safe_set_fill(cell_avg, get_fill_for_confidence(avg_conf))
+                    safe_set_fill(cell_avg, get_fill_for_confidence(avg_conf))"""
 
                     first_item = False
 
