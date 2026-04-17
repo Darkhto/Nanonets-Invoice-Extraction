@@ -6,7 +6,9 @@ import io
 import traceback
 import re
 import logging
+import uuid
 from datetime import datetime
+from threading import Thread
 from flask import Flask, request, jsonify, render_template, send_file, session
 from werkzeug.utils import secure_filename
 import openpyxl
@@ -17,12 +19,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'weibfewb21712897')  # Use env var in production
+app.secret_key = os.environ.get('SECRET_KEY', 'sajbbnffnfkqnjf7qw68767qw62')
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB limit
 
 # --- API Configuration ---
 #NANONETS_API_KEY = os.environ.get('NANONETS_API_KEY')
-NANONETS_API_KEY = "b958302e-6c0a-401b-8bb3-b25083fbf7ae"
+NANONETS_API_KEY = "b958302e-6c0a-401b-8bb3-b25083fbf7ae"  # Replace with your actual API key
 if not NANONETS_API_KEY:
     raise ValueError("NANONETS_API_KEY environment variable not set")
 
@@ -51,6 +53,9 @@ EXTRACTION_SCHEMA = {
         }
     }
 }
+
+# In-memory job store (for single worker)
+jobs = {}
 
 # ------------------------------------------------------------
 # Helper Functions
@@ -100,6 +105,111 @@ def standardize_payment_term(term_str):
             return mapping[num], False
     return "COD", True
 
+def to_number(value):
+    """Convert value to float, default 0."""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = re.sub(r'[^\d.\-]', '', value.replace('%', '').strip())
+        if cleaned == '':
+            return 0
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0
+    return 0
+
+def clean_discount_tax(value):
+    """Return string value for discount/tax, default '0'."""
+    if value is None:
+        return "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else "0"
+    return "0"
+
+def poll_and_store_result(job_id, record_id, filename, headers):
+    """Background task: poll Nanonets and store result."""
+    max_attempts = 60
+    interval = 3
+    for _ in range(max_attempts):
+        try:
+            resp = requests.get(
+                RESULTS_ENDPOINT.format(record_id),
+                headers=headers,
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            status = data.get("status")
+            if status == "completed":
+                json_result = data.get("result", {}).get("json", {})
+                extracted = json_result.get("content", {})
+                metadata = json_result.get("metadata", {})
+                confidence_scores = metadata.get("confidence_score", {})
+
+                extracted['invoice_date'] = standardize_date(extracted.get('invoice_date'))
+
+                field_confidences = {}
+                for field in ["supplier_name", "invoice_id", "invoice_date", "payment_term"]:
+                    field_confidences[field] = confidence_scores.get(field)
+
+                line_items_conf = []
+                line_items = extracted.get("line_items", [])
+                line_items_conf_raw = confidence_scores.get("line_items", {})
+                ref_keys = list(line_items_conf_raw.keys())
+                for i, item in enumerate(line_items):
+                    item_conf = {}
+                    if i < len(ref_keys):
+                        ref_key = ref_keys[i]
+                        item_conf_data = line_items_conf_raw.get(ref_key, {})
+                        for subfield in ["description", "quantity", "unit_price", "discount", "tax"]:
+                            item_conf[subfield] = item_conf_data.get(subfield)
+                    else:
+                        for subfield in ["description", "quantity", "unit_price", "discount", "tax"]:
+                            item_conf[subfield] = None
+                    line_items_conf.append(item_conf)
+
+                all_confidences = list(field_confidences.values())
+                for ic in line_items_conf:
+                    all_confidences.extend(ic.values())
+                valid_confs = [c for c in all_confidences if c is not None]
+                avg_confidence = sum(valid_confs) / len(valid_confs) if valid_confs else None
+
+                jobs[job_id] = {
+                    "filename": filename,
+                    "status": "completed",
+                    "result": {
+                        "file": filename,
+                        "extracted_data": extracted,
+                        "field_confidences": field_confidences,
+                        "line_items_confidences": line_items_conf,
+                        "average_confidence": avg_confidence
+                    }
+                }
+                return
+            elif status == "failed":
+                jobs[job_id] = {
+                    "filename": filename,
+                    "status": "failed",
+                    "error": data.get("message", "Processing failed")
+                }
+                return
+            time.sleep(interval)
+        except Exception as e:
+            logger.warning(f"Polling error for {job_id}: {e}")
+            time.sleep(interval)
+
+    jobs[job_id] = {
+        "filename": filename,
+        "status": "timeout",
+        "error": "Processing timed out"
+    }
+
 # ------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------
@@ -107,8 +217,13 @@ def standardize_payment_term(term_str):
 def index():
     return render_template('index.html')
 
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok"}), 200
+
 @app.route('/extract', methods=['POST'])
-def extract_invoices():
+def submit_extraction():
+    """Submit files to batch endpoint and return job IDs immediately."""
     try:
         if 'files' not in request.files:
             return jsonify({"error": "No files uploaded"}), 400
@@ -117,105 +232,86 @@ def extract_invoices():
         if not files:
             return jsonify({"error": "Empty file list"}), 400
 
-        headers = {"Authorization": f"Bearer {NANONETS_API_KEY}"}
-        sync_url = "https://extraction-api.nanonets.com/api/v1/extract/sync"
+        multipart_data = {
+            'output_format': 'json',
+            'json_options': json.dumps(EXTRACTION_SCHEMA),
+            'include_metadata': 'confidence_score'
+        }
 
-        formatted_results = []
-
+        file_tuples = []
         for f in files:
             if f.filename == '':
                 continue
-
             filename = secure_filename(f.filename)
+            file_tuples.append(('files', (filename, f.read(), f.content_type)))
 
-            # Prepare the multipart data for this single file
-            multipart_data = {
-                'output_format': 'json',
-                'json_options': json.dumps(EXTRACTION_SCHEMA),
-                'include_metadata': 'confidence_score'
+        if not file_tuples:
+            return jsonify({"error": "No valid files"}), 400
+
+        headers = {"Authorization": f"Bearer {NANONETS_API_KEY}"}
+        batch_resp = requests.post(
+            BATCH_ENDPOINT,
+            headers=headers,
+            files=file_tuples,
+            data=multipart_data,
+            timeout=30
+        )
+        batch_resp.raise_for_status()
+        batch_data = batch_resp.json()
+        records = batch_data.get("records", [])
+
+        job_ids = []
+        for idx, record in enumerate(records):
+            record_id = record.get("record_id")
+            original_filename = files[idx].filename if idx < len(files) else record.get("filename", f"file_{idx}.pdf")
+
+            if not record_id:
+                continue
+
+            job_id = str(uuid.uuid4())
+            jobs[job_id] = {
+                "record_id": record_id,
+                "filename": original_filename,
+                "status": "processing",
+                "result": None
             }
+            job_ids.append(job_id)
 
-            try:
-                resp = requests.post(
-                    sync_url,
-                    headers=headers,
-                    files={'file': (filename, f.read(), f.content_type)},
-                    data=multipart_data,
-                    timeout=60  # generous timeout for a single file
-                )
-                resp.raise_for_status()
-                result_data = resp.json()
-            except requests.exceptions.Timeout:
-                formatted_results.append({
-                    "file": filename,
-                    "error": "Request timed out",
-                    "extracted_data": None,
-                    "confidence": None
-                })
-                continue
-            except Exception as e:
-                formatted_results.append({
-                    "file": filename,
-                    "error": f"API error: {str(e)}",
-                    "extracted_data": None,
-                    "confidence": None
-                })
-                continue
+            # Start background polling thread
+            Thread(target=poll_and_store_result, args=(job_id, record_id, original_filename, headers), daemon=True).start()
 
-            # Extract the content and metadata (same as before)
-            json_result = result_data.get("result", {}).get("json", {})
-            extracted = json_result.get("content", {})
-            metadata = json_result.get("metadata", {})
-            confidence_scores = metadata.get("confidence_score", {})
-
-            # Standardize date
-            extracted['invoice_date'] = standardize_date(extracted.get('invoice_date'))
-
-            field_confidences = {}
-            for field in ["supplier_name", "invoice_id", "invoice_date", "payment_term"]:
-                field_confidences[field] = confidence_scores.get(field)
-
-            line_items_conf = []
-            line_items = extracted.get("line_items", [])
-            line_items_conf_raw = confidence_scores.get("line_items", {})
-            ref_keys = list(line_items_conf_raw.keys())
-            for i, item in enumerate(line_items):
-                item_conf = {}
-                if i < len(ref_keys):
-                    ref_key = ref_keys[i]
-                    item_conf_data = line_items_conf_raw.get(ref_key, {})
-                    for subfield in ["description", "quantity", "unit_price", "discount", "tax"]:
-                        item_conf[subfield] = item_conf_data.get(subfield)
-                else:
-                    for subfield in ["description", "quantity", "unit_price", "discount", "tax"]:
-                        item_conf[subfield] = None
-                line_items_conf.append(item_conf)
-
-            all_confidences = list(field_confidences.values())
-            for ic in line_items_conf:
-                all_confidences.extend(ic.values())
-            valid_confs = [c for c in all_confidences if c is not None]
-            avg_confidence = sum(valid_confs) / len(valid_confs) if valid_confs else None
-
-            formatted_results.append({
-                "file": filename,
-                "extracted_data": extracted,
-                "field_confidences": field_confidences,
-                "line_items_confidences": line_items_conf,
-                "average_confidence": avg_confidence
-            })
-
-        session['extraction_results'] = json.dumps(formatted_results)
-        return jsonify({"results": formatted_results})
+        return jsonify({"job_ids": job_ids})
 
     except Exception as e:
-        logger.error(f"Extraction failed: {e}", exc_info=True)
+        logger.error(f"Submission failed: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
+
+@app.route('/status/<job_id>')
+def get_status(job_id):
+    """Return current status/result of a job."""
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job)
+
+@app.route('/results/batch', methods=['POST'])
+def get_batch_results():
+    """Return results for a list of job IDs."""
+    data = request.get_json()
+    job_ids = data.get('job_ids', [])
+    results = []
+    for jid in job_ids:
+        job = jobs.get(jid)
+        if job and job.get('status') == 'completed':
+            results.append(job['result'])
+        elif job and job.get('status') == 'failed':
+            results.append({"file": job['filename'], "error": job.get('error')})
+    return jsonify({"results": results})
 
 @app.route('/export', methods=['POST'])
 def export_excel():
     try:
-        data = request.get_json(silent=True)  # FIXED: 'silent' not 'silent'
+        data = request.get_json(silent=True)
         if data and 'results' in data:
             results = data['results']
         elif 'extraction_results' in session:
@@ -223,7 +319,6 @@ def export_excel():
         else:
             return jsonify({"error": "No extraction results available"}), 400
 
-        # Use absolute path based on this file's location
         template_path = os.path.join(os.path.dirname(__file__), 'purchase_bills.xlsx')
         if not os.path.exists(template_path):
             logger.error(f"Template file not found at {template_path}")
@@ -299,7 +394,7 @@ def export_excel():
                     ws.cell(row=current_row, column=10).value = 'Non-Interco, Warehouse Picorp'
 
                     avg_conf = invoice.get('average_confidence')
-                    cell_avg = ws.cell(row=current_row, column=23)  # Column W (23rd)
+                    cell_avg = ws.cell(row=current_row, column=23)
                     cell_avg.value = avg_conf
                     safe_set_fill(cell_avg, get_fill_for_confidence(avg_conf))
 
@@ -323,17 +418,17 @@ def export_excel():
                     cell_price.value = unit_price
                     safe_set_fill(cell_price, get_fill_for_confidence(item_conf.get('unit_price')))
 
-                discount = item.get('discount')
-                if discount is not None:
-                    cell_disc = ws.cell(row=current_row, column=19)
-                    cell_disc.value = discount
-                    safe_set_fill(cell_disc, get_fill_for_confidence(item_conf.get('discount')))
+                discount_raw = item.get('discount')
+                discount_value = clean_discount_tax(discount_raw)
+                cell_disc = ws.cell(row=current_row, column=19)
+                cell_disc.value = discount_value
+                safe_set_fill(cell_disc, get_fill_for_confidence(item_conf.get('discount')))
 
-                tax = item.get('tax')
-                if tax is not None:
-                    cell_tax = ws.cell(row=current_row, column=20)
-                    cell_tax.value = tax
-                    safe_set_fill(cell_tax, get_fill_for_confidence(item_conf.get('tax')))
+                tax_raw = item.get('tax')
+                tax_value = clean_discount_tax(tax_raw)
+                cell_tax = ws.cell(row=current_row, column=20)
+                cell_tax.value = tax_value
+                safe_set_fill(cell_tax, get_fill_for_confidence(item_conf.get('tax')))
 
                 current_row += 1
 
@@ -355,9 +450,7 @@ def export_excel():
 @app.errorhandler(Exception)
 def handle_exception(e):
     logger.error(f"Unhandled exception: {e}", exc_info=True)
-    response = jsonify({"error": "Internal server error", "details": str(e)})
-    response.status_code = 500
-    return response
+    return jsonify({"error": str(e), "type": type(e).__name__}), 500
 
 # ------------------------------------------------------------
 # Main Entry Point

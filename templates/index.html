@@ -33,7 +33,7 @@
     </div>
 
     <script>
-        let extractionResults = null;
+        let extractionResults = null;  // Will store the final results for export
 
         async function uploadFiles() {
             const files = document.getElementById('fileInput').files;
@@ -45,7 +45,7 @@
             const statusDiv = document.getElementById('status');
             const resultsDiv = document.getElementById('results');
             const exportBtn = document.getElementById('exportBtn');
-            statusDiv.textContent = 'Processing...';
+            statusDiv.textContent = 'Submitting files...';
             resultsDiv.innerHTML = '';
             exportBtn.style.display = 'none';
 
@@ -55,20 +55,56 @@
             }
 
             try {
-                const response = await fetch('/extract', {
+                // 1. Submit files to start extraction
+                const submitResp = await fetch('/extract', {
                     method: 'POST',
                     body: formData
                 });
-
-                const data = await response.json();
-                if (!response.ok) {
-                    throw new Error(data.error || 'Request failed');
+                const submitData = await submitResp.json();
+                if (!submitResp.ok) {
+                    throw new Error(submitData.error || 'Submission failed');
                 }
 
-                extractionResults = data;
-                displayResults(data.results);
-                exportBtn.style.display = 'inline-block';
-                statusDiv.textContent = `Completed processing ${files.length} file(s).`;
+                const jobIds = submitData.job_ids;
+                if (!jobIds || jobIds.length === 0) {
+                    throw new Error('No job IDs returned');
+                }
+
+                statusDiv.textContent = `Processing ${jobIds.length} file(s)...`;
+
+                // 2. Poll for results
+                const pollInterval = 3000; // 3 seconds
+                let allDone = false;
+                let attempts = 0;
+                const maxAttempts = 60; // 3 minutes max
+
+                while (!allDone && attempts < maxAttempts) {
+                    await new Promise(resolve => setTimeout(resolve, pollInterval));
+                    attempts++;
+
+                    const statusResp = await fetch('/results/batch', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ job_ids: jobIds })
+                    });
+                    const statusData = await statusResp.json();
+
+                    const completedCount = statusData.results ? statusData.results.length : 0;
+                    statusDiv.textContent = `Processing... (${completedCount}/${jobIds.length} done)`;
+
+                    if (completedCount === jobIds.length) {
+                        allDone = true;
+                        extractionResults = statusData;  // Save for export
+                        displayResults(statusData.results);
+                        exportBtn.style.display = 'inline-block';
+                        statusDiv.textContent = `Completed processing ${completedCount} file(s).`;
+                    }
+                }
+
+                if (!allDone) {
+                    throw new Error('Processing timed out. Some files may still be processing.');
+                }
+
             } catch (error) {
                 statusDiv.innerHTML = `<span class="error">Error: ${error.message}</span>`;
                 console.error(error);
