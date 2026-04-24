@@ -24,7 +24,7 @@ app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB limit
 
 # --- API Configuration ---
 #NANONETS_API_KEY = os.environ.get('NANONETS_API_KEY')
-NANONETS_API_KEY = "b958302e-6c0a-401b-8bb3-b25083fbf7ae"  # Replace with your actual API key
+NANONETS_API_KEY = os.environ.get('NANONETS_API_KEY')  # Replace with your actual API key
 if not NANONETS_API_KEY:
     raise ValueError("NANONETS_API_KEY environment variable not set")
 
