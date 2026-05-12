@@ -1,53 +1,234 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Invoice Batch Extractor</title>
+    <title>Invoice Batch Extractor – Auto Tags</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body { font-family: Arial, sans-serif; margin: 2rem; }
-        .container { max-width: 1400px; margin: auto; }
-        input, button { margin: 10px 5px; padding: 8px 16px; }
-        table { border-collapse: collapse; width: 100%; margin-top: 20px; font-size: 0.9em; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background-color: #f2f2f2; }
-        .confidence { font-size: 0.85em; }
-        .error { color: red; }
-        .export-btn { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
-        .export-btn:hover { background-color: #45a049; }
-        .file-section { margin-bottom: 30px; border-bottom: 2px solid #ccc; padding-bottom: 20px; }
-        .file-title { font-weight: bold; font-size: 1.2em; margin-bottom: 10px; }
-        .conf-high { color: green; font-weight: bold; }
-        .conf-medium { color: #FF8C00; font-weight: bold; }
-        .conf-low { color: red; font-weight: bold; }
+        body { background-color: #f8f9fc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .container { max-width: 1400px; }
+        .card { border-radius: 1rem; box-shadow: 0 0.5rem 1rem rgba(0,0,0,0.1); margin-bottom: 2rem; }
+        .card-header { background-color: #2c3e50; color: white; border-radius: 1rem 1rem 0 0 !important; }
+        .result-file-name { color: #000000 !important; font-weight: 600; }
+        .tag-badge { background-color: #e9ecef; padding: 0.25rem 0.75rem; border-radius: 2rem; font-size: 0.85rem; margin: 0.2rem; display: inline-block; }
+        .progress-bar { transition: width 0.5s; }
+        .conf-low { color: #dc3545; font-weight: bold; }
+        .conf-medium { color: #fd7e14; font-weight: bold; }
+        .conf-high { color: #198754; font-weight: bold; }
+        .modal-checkbox-group { max-height: 60vh; overflow-y: auto; }
+        .category-title { font-weight: bold; margin-top: 0.75rem; background: #f1f3f5; padding: 0.3rem; border-radius: 0.5rem; }
+        .form-check { margin-left: 1rem; }
+        .result-tags { margin-top: 0.5rem; }
+        .selected-file-item { display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0.75rem; background: #f8f9fa; border-radius: 0.5rem; margin-bottom: 0.5rem; }
+        .selected-file-name { font-weight: 500; word-break: break-all; }
+        .remove-file-btn { cursor: pointer; color: #dc3545; font-weight: bold; background: none; border: none; }
+        .remove-file-btn:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Invoice Data Extractor</h1>
-        <p>Upload multiple PDF invoices. Extracts: Supplier, Invoice ID, Date, Payment Term, Line Items (with discount/tax), and confidence scores.</p>
+    <div class="container py-4">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="mb-0">📄 Invoice Data Extractor – Auto Tags</h2>
+            </div>
+            <div class="card-body">
+                <p class="lead">Upload PDF invoices → extract data → automatically assign <strong>"Non-Interco"</strong> and <strong>"Warehouse Picorp"</strong> to every invoice. Tags appear in column J of the Excel report.</p>
 
-        <input type="file" id="fileInput" multiple accept=".pdf,application/pdf">
-        <button onclick="uploadFiles()">Extract Data</button>
-        <button id="exportBtn" class="export-btn" onclick="exportToExcel()" style="display:none;">Download Excel Report</button>
-        <div id="status"></div>
-        <div id="results"></div>
+                <div class="alert alert-info">
+                    <strong>How it works:</strong> After extraction, each invoice card will already show the two default tags. You can click <strong>"Select Tags"</strong> to add more tags or remove the defaults. The Excel export includes all tags you've saved.
+                </div>
+
+                <div class="mb-3">
+                    <label for="fileInput" class="form-label">Select PDF Invoices</label>
+                    <input class="form-control" type="file" id="fileInput" multiple accept=".pdf,application/pdf">
+                </div>
+
+                <!-- Selected files preview -->
+                <div id="selectedFilesContainer" class="mb-3" style="display: none;">
+                    <h5>Selected Files</h5>
+                    <div id="selectedFilesList"></div>
+                </div>
+
+                <div class="d-flex gap-2">
+                    <button class="btn btn-primary" id="extractBtn" onclick="uploadFiles()">🚀 Extract Data</button>
+                    <button id="exportBtn" class="btn btn-success" onclick="exportToExcel()" style="display: none;">📥 Download Excel Report</button>
+                </div>
+
+                <div id="status" class="mt-3"></div>
+                <div id="results" class="mt-4"></div>
+            </div>
+        </div>
     </div>
 
-    <script>
-        let extractionResults = null;  // Will store the final results for export
+    <!-- Tag Selection Modal -->
+    <div class="modal fade" id="tagModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title">🏷️ Select Tags for <span id="modalFileName"></span></h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="small">Choose extra tags to assign. Default tags (<strong>Non-Interco</strong> and <strong>Warehouse Picorp</strong>) are already present – you may uncheck any you don't want.</p>
+                    <div id="tagCheckboxes" class="modal-checkbox-group"></div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="saveTagsBtn">Save Tags</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // ======================= TAG DATA STRUCTURE =======================
+        const tagCategories = {
+            "Budgeting": ["CAPX", "CEKI", "CEOO", "FACI", "FINC", "HURE", "INGD", "LOGT", "MKTG", "OPES", "OPSP", "PROC", "RNDV", "RPMN", "RTUT", "SLRS", "TECH", "TRAI", "WARE"],
+            "Chicken Tenders": ["Zenders"],
+            "Consolidated": ["Interco", "Non-Interco"],
+            "Mokky Ara Damansara Sdn Bhd": ["Ara Damansara"],
+            "Mokky Bukit Jelutong Sdn Bhd": ["All - OBJ, OBT, OSP", "Bukit Jelutong", "Bukit Tunku", "Subang Parade"],
+            "Mokky Bukit Kiara Sdn Bhd": ["KLGCC Mall"],
+            "Mokky Chef Kecil Sdn Bhd": ["Semenyih"],
+            "Mokky Food Services (M) Sdn Bhd": ["All - MFS", "Central Kitchen Bukit Jelutong (x130825)", "Central Kitchen Picorp (x130825)", "Glo Damansara", "Headquarter", "PKNS", "Warehouse Picorp"],
+            "Mokky Prepping Sdn Bhd": ["All - CBJ, CPC", "Central Kitchen Bukit Jelutong", "Central Kitchen Picorp"],
+            "Mokky Setapak Sdn Bhd": ["Setapak"],
+            "Pizza Pastry People Sdn Bhd": ["IOI Putrajaya"],
+            "Seksyen 6": ["CK Seksyen 6"]
+        };
+
+        // Global storage for extraction results
+        let extractionResults = null;
+
+        function getResultIndexByFilename(filename) {
+            if (!extractionResults) return -1;
+            for (let i = 0; i < extractionResults.results.length; i++) {
+                if (extractionResults.results[i].file === filename) return i;
+            }
+            return -1;
+        }
+
+        // Modal state
+        let currentModalFile = null;
+        let currentTempTags = [];
+
+        // DOM elements
+        const fileInput = document.getElementById('fileInput');
+        const selectedFilesContainer = document.getElementById('selectedFilesContainer');
+        const selectedFilesList = document.getElementById('selectedFilesList');
+        const statusDiv = document.getElementById('status');
+        const resultsDiv = document.getElementById('results');
+        const exportBtn = document.getElementById('exportBtn');
+        const tagModal = new bootstrap.Modal(document.getElementById('tagModal'));
+        const tagCheckboxesDiv = document.getElementById('tagCheckboxes');
+        const saveTagsBtn = document.getElementById('saveTagsBtn');
+        const modalFileNameSpan = document.getElementById('modalFileName');
+
+        // Update the selected files preview
+        function updateSelectedFilesPreview() {
+            const files = Array.from(fileInput.files);
+            if (files.length === 0) {
+                selectedFilesContainer.style.display = 'none';
+                selectedFilesList.innerHTML = '';
+                return;
+            }
+            selectedFilesContainer.style.display = 'block';
+            selectedFilesList.innerHTML = '';
+            files.forEach((file, idx) => {
+                const div = document.createElement('div');
+                div.className = 'selected-file-item';
+                div.innerHTML = `
+                    <span class="selected-file-name">${escapeHtml(file.name)}</span>
+                    <button type="button" class="remove-file-btn btn-sm" data-index="${idx}">✖ Remove</button>
+                `;
+                const removeBtn = div.querySelector('.remove-file-btn');
+                removeBtn.addEventListener('click', () => {
+                    const dt = new DataTransfer();
+                    const currentFiles = Array.from(fileInput.files);
+                    const newFiles = currentFiles.filter((_, i) => i !== idx);
+                    for (let f of newFiles) dt.items.add(f);
+                    fileInput.files = dt.files;
+                    updateSelectedFilesPreview();
+                });
+                selectedFilesList.appendChild(div);
+            });
+        }
+
+        fileInput.addEventListener('change', updateSelectedFilesPreview);
+
+        // Render checkboxes for modal, pre-selecting any tags currently stored for the file
+        function renderTagModalCheckboxes(selectedTags) {
+            tagCheckboxesDiv.innerHTML = '';
+            for (const [category, subs] of Object.entries(tagCategories)) {
+                const categoryDiv = document.createElement('div');
+                categoryDiv.classList.add('category-title');
+                categoryDiv.innerText = category;
+                tagCheckboxesDiv.appendChild(categoryDiv);
+                for (const sub of subs) {
+                    const div = document.createElement('div');
+                    div.classList.add('form-check');
+                    const cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.classList.add('form-check-input');
+                    cb.value = sub;
+                    cb.id = `chk_${sub.replace(/[^a-zA-Z0-9]/g, '_')}`;
+                    cb.checked = selectedTags.includes(sub);
+                    const label = document.createElement('label');
+                    label.classList.add('form-check-label');
+                    label.htmlFor = cb.id;
+                    label.innerText = sub;
+                    div.appendChild(cb);
+                    div.appendChild(label);
+                    tagCheckboxesDiv.appendChild(div);
+                }
+            }
+        }
+
+        function openTagModal(filename) {
+            const idx = getResultIndexByFilename(filename);
+            if (idx === -1) return;
+            const currentTags = extractionResults.results[idx].tags || [];
+            currentModalFile = filename;
+            currentTempTags = [...currentTags];
+            modalFileNameSpan.innerText = filename;
+            renderTagModalCheckboxes(currentTempTags);
+            
+            const checkboxes = tagCheckboxesDiv.querySelectorAll('input[type="checkbox"]');
+            checkboxes.forEach(cb => {
+                cb.addEventListener('change', (e) => {
+                    if (cb.checked) {
+                        if (!currentTempTags.includes(cb.value)) currentTempTags.push(cb.value);
+                    } else {
+                        currentTempTags = currentTempTags.filter(t => t !== cb.value);
+                    }
+                });
+            });
+            tagModal.show();
+        }
+
+        saveTagsBtn.onclick = () => {
+            if (currentModalFile) {
+                const idx = getResultIndexByFilename(currentModalFile);
+                if (idx !== -1) {
+                    extractionResults.results[idx].tags = [...currentTempTags];
+                    displayResults(extractionResults.results);
+                }
+            }
+            tagModal.hide();
+        };
+
+        // =============== Extraction and Polling ===============
         async function uploadFiles() {
-            const files = document.getElementById('fileInput').files;
+            const files = fileInput.files;
             if (files.length === 0) {
                 alert('Please select at least one PDF file.');
                 return;
             }
 
-            const statusDiv = document.getElementById('status');
-            const resultsDiv = document.getElementById('results');
-            const exportBtn = document.getElementById('exportBtn');
-            statusDiv.textContent = 'Submitting files...';
+            statusDiv.innerHTML = '<div class="alert alert-info">Submitting files...</div>';
             resultsDiv.innerHTML = '';
             exportBtn.style.display = 'none';
+            extractionResults = null;
 
             const formData = new FormData();
             for (let file of files) {
@@ -55,59 +236,56 @@
             }
 
             try {
-                // 1. Submit files to start extraction
                 const submitResp = await fetch('/extract', {
                     method: 'POST',
                     body: formData
                 });
                 const submitData = await submitResp.json();
-                if (!submitResp.ok) {
-                    throw new Error(submitData.error || 'Submission failed');
-                }
-
+                if (!submitResp.ok) throw new Error(submitData.error || 'Submission failed');
                 const jobIds = submitData.job_ids;
-                if (!jobIds || jobIds.length === 0) {
-                    throw new Error('No job IDs returned');
-                }
+                if (!jobIds || jobIds.length === 0) throw new Error('No job IDs returned');
 
-                statusDiv.textContent = `Processing ${jobIds.length} file(s)...`;
+                statusDiv.innerHTML = `<div class="alert alert-secondary">Processing ${jobIds.length} file(s)... <div class="progress mt-2"><div class="progress-bar progress-bar-striped progress-bar-animated" style="width: 0%"></div></div></div>`;
+                const progressBar = document.querySelector('.progress-bar');
 
-                // 2. Poll for results
-                const pollInterval = 3000; // 3 seconds
                 let allDone = false;
                 let attempts = 0;
-                const maxAttempts = 60; // 3 minutes max
+                const maxAttempts = 60;
+                const pollInterval = 3000;
 
                 while (!allDone && attempts < maxAttempts) {
                     await new Promise(resolve => setTimeout(resolve, pollInterval));
                     attempts++;
-
                     const statusResp = await fetch('/results/batch', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ job_ids: jobIds })
                     });
                     const statusData = await statusResp.json();
-
-                    const completedCount = statusData.results ? statusData.results.length : 0;
-                    statusDiv.textContent = `Processing... (${completedCount}/${jobIds.length} done)`;
+                    const completedResults = statusData.results ? statusData.results.filter(r => !r.error && r.status !== 'processing') : [];
+                    const completedCount = completedResults.length;
+                    const percent = (completedCount / jobIds.length) * 100;
+                    if (progressBar) progressBar.style.width = `${percent}%`;
 
                     if (completedCount === jobIds.length) {
                         allDone = true;
-                        extractionResults = statusData;  // Save for export
-                        displayResults(statusData.results);
+                        // Auto-populate default tags for each result
+                        for (let res of statusData.results) {
+                            if (!res.error && res.status !== 'processing') {
+                                // Start with the two default tags
+                                res.tags = ['Non-Interco', 'Warehouse Picorp'];
+                            }
+                        }
+                        extractionResults = statusData;
+                        displayResults(extractionResults.results);
                         exportBtn.style.display = 'inline-block';
-                        statusDiv.textContent = `Completed processing ${completedCount} file(s).`;
+                        statusDiv.innerHTML = `<div class="alert alert-success">✅ Completed processing ${completedCount} file(s). Default tags (Non-Interco, Warehouse Picorp) have been auto-assigned. You can edit tags by clicking "Select Tags".</div>`;
                     }
                 }
-
-                if (!allDone) {
-                    throw new Error('Processing timed out. Some files may still be processing.');
-                }
-
-            } catch (error) {
-                statusDiv.innerHTML = `<span class="error">Error: ${error.message}</span>`;
-                console.error(error);
+                if (!allDone) throw new Error('Processing timed out.');
+            } catch (err) {
+                statusDiv.innerHTML = `<div class="alert alert-danger">Error: ${err.message}</div>`;
+                console.error(err);
             }
         }
 
@@ -119,139 +297,105 @@
         }
 
         function displayResults(results) {
-            const resultsDiv = document.getElementById('results');
-            let html = '';
-
-            results.forEach((result, idx) => {
-                html += `<div class="file-section">`;
-                html += `<div class="file-title">📄 ${result.file}</div>`;
+            resultsDiv.innerHTML = '';
+            for (let result of results) {
                 if (result.error) {
-                    html += `<p class="error">Error: ${result.error}</p>`;
-                } else {
-                    const data = result.extracted_data;
-                    const avgConfValue = result.average_confidence;
-                    const avgConfDisplay = avgConfValue ? avgConfValue.toFixed(2) : 'N/A';
-                    const avgConfClass = getConfidenceClass(avgConfValue);
-                    html += `<p><strong>Average Confidence:</strong> <span class="${avgConfClass}">${avgConfDisplay}%</span></p>`;
-
-                    const supConf = result.field_confidences.supplier_name;
-                    const supClass = getConfidenceClass(supConf);
-                    const invConf = result.field_confidences.invoice_id;
-                    const invClass = getConfidenceClass(invConf);
-                    const dateConf = result.field_confidences.invoice_date;
-                    const dateClass = getConfidenceClass(dateConf);
-                    const payConf = result.field_confidences.payment_term;
-                    const payClass = getConfidenceClass(payConf);
-
-                    html += `<table>
-                        <tr><th>Field</th><th>Value</th><th>Confidence</th></tr>
-                        <tr>
-                            <td>Supplier Name</td>
-                            <td>${data.supplier_name || ''}</td>
-                            <td class="confidence"><span class="${supClass}">${supConf || 'N/A'}</span></td>
-                        </tr>
-                        <tr>
-                            <td>Invoice ID</td>
-                            <td>${data.invoice_id || ''}</td>
-                            <td class="confidence"><span class="${invClass}">${invConf || 'N/A'}</span></td>
-                        </tr>
-                        <tr>
-                            <td>Invoice Date</td>
-                            <td>${data.invoice_date || ''}</td>
-                            <td class="confidence"><span class="${dateClass}">${dateConf || 'N/A'}</span></td>
-                        </tr>
-                        <tr>
-                            <td>Payment Term</td>
-                            <td>${data.payment_term || ''}</td>
-                            <td class="confidence"><span class="${payClass}">${payConf || 'N/A'}</span></td>
-                        </tr>
-                    </table>`;
-
-                    if (data.line_items && data.line_items.length > 0) {
-                        html += `<h4>Line Items</h4>`;
-                        html += `<table>
-                            <tr>
-                                <th>Description</th>
-                                <th>Qty</th>
-                                <th>Unit Price</th>
-                                <th>Discount</th>
-                                <th>Tax</th>
-                                <th>Confidence (Desc/Qty/Price/Disc/Tax)</th>
-                            </tr>`;
-                        data.line_items.forEach((item, i) => {
-                            const conf = result.line_items_confidences[i] || {};
-                            const descConf = conf.description;
-                            const descClass = getConfidenceClass(descConf);
-                            const qtyConf = conf.quantity;
-                            const qtyClass = getConfidenceClass(qtyConf);
-                            const priceConf = conf.unit_price;
-                            const priceClass = getConfidenceClass(priceConf);
-                            const discConf = conf.discount;
-                            const discClass = getConfidenceClass(discConf);
-                            const taxConf = conf.tax;
-                            const taxClass = getConfidenceClass(taxConf);
-
-                            html += `<tr>
-                                <td>${item.description || ''}</td>
-                                <td>${item.quantity || ''}</td>
-                                <td>${item.unit_price || ''}</td>
-                                <td>${item.discount || ''}</td>
-                                <td>${item.tax || ''}</td>
-                                <td class="confidence">
-                                    <span class="${descClass}">${descConf || 'N/A'}</span> / 
-                                    <span class="${qtyClass}">${qtyConf || 'N/A'}</span> / 
-                                    <span class="${priceClass}">${priceConf || 'N/A'}</span> / 
-                                    <span class="${discClass}">${discConf || 'N/A'}</span> / 
-                                    <span class="${taxClass}">${taxConf || 'N/A'}</span>
-                                </td>
-                            </tr>`;
-                        });
-                        html += `</table>`;
-                    }
+                    const errCard = document.createElement('div');
+                    errCard.className = 'card mt-3 border-danger';
+                    errCard.innerHTML = `<div class="card-header bg-danger text-white">❌ Error: ${result.file || 'Unknown'}</div>
+                                         <div class="card-body"><p class="text-danger">${result.error}</p></div>`;
+                    resultsDiv.appendChild(errCard);
+                    continue;
                 }
-                html += `</div>`;
-            });
+                if (result.status === 'processing') {
+                    const procCard = document.createElement('div');
+                    procCard.className = 'card mt-3';
+                    procCard.innerHTML = `<div class="card-header bg-secondary text-white">⏳ ${result.file}</div>
+                                         <div class="card-body"><p>Still processing...</p></div>`;
+                    resultsDiv.appendChild(procCard);
+                    continue;
+                }
 
-            resultsDiv.innerHTML = html;
+                const data = result.extracted_data;
+                const avgConf = result.average_confidence;
+                const avgClass = getConfidenceClass(avgConf);
+                const tags = result.tags || [];
+                const tagsHtml = tags.map(t => `<span class="tag-badge">${escapeHtml(t)}</span>`).join('') || '<span class="text-muted small">No tags assigned</span>';
+
+                const card = document.createElement('div');
+                card.className = 'card mt-3';
+                card.innerHTML = `
+                    <div class="card-header bg-light d-flex justify-content-between align-items-center">
+                        <strong class="result-file-name">📄 ${escapeHtml(result.file)}</strong>
+                        <button class="btn btn-sm btn-outline-secondary" onclick="openTagModal('${escapeJsString(result.file)}')">🏷️ Select Tags</button>
+                    </div>
+                    <div class="card-body">
+                        <p><strong>Average Confidence:</strong> <span class="${avgClass}">${avgConf ? avgConf.toFixed(2) : 'N/A'}%</span></p>
+                        <table class="table table-sm table-bordered">
+                            <tr><th>Supplier</th><td>${escapeHtml(data.supplier_name || '')}</td><td class="${getConfidenceClass(result.field_confidences.supplier_name)}">${result.field_confidences.supplier_name || 'N/A'}</td></tr>
+                            <tr><th>Invoice ID</th><td>${escapeHtml(data.invoice_id || '')}</td><td class="${getConfidenceClass(result.field_confidences.invoice_id)}">${result.field_confidences.invoice_id || 'N/A'}</td></tr>
+                            <tr><th>Date</th><td>${escapeHtml(data.invoice_date || '')}</td><td class="${getConfidenceClass(result.field_confidences.invoice_date)}">${result.field_confidences.invoice_date || 'N/A'}</td></tr>
+                            <tr><th>Payment Term</th><td>${escapeHtml(data.payment_term || '')}</td><td class="${getConfidenceClass(result.field_confidences.payment_term)}">${result.field_confidences.payment_term || 'N/A'}</td></tr>
+                        </table>
+                        <div class="result-tags"><strong>Tags:</strong> <span id="tags-${escapeHtml(result.file.replace(/[^a-zA-Z0-9]/g, '_'))}">${tagsHtml}</span></div>
+                `;
+
+                if (data.line_items && data.line_items.length) {
+                    let itemsHtml = `<h6 class="mt-3">Line Items</h6><table class="table table-sm"><thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Discount</th><th>Tax</th><th>Confidence (Desc/Qty/Price/Disc/Tax)</th></tr></thead><tbody>`;
+                    data.line_items.forEach((item, i) => {
+                        const ic = result.line_items_confidences[i] || {};
+                        itemsHtml += `<tr>
+                            <td>${escapeHtml(item.description || '')}</td>
+                            <td>${item.quantity ?? ''}</td>
+                            <td>${item.unit_price ?? ''}</td>
+                            <td>${escapeHtml(item.discount || '')}</td>
+                            <td>${escapeHtml(item.tax || '')}</td>
+                            <td>
+                                <span class="${getConfidenceClass(ic.description)}">${ic.description || 'N/A'}</span> /
+                                <span class="${getConfidenceClass(ic.quantity)}">${ic.quantity || 'N/A'}</span> /
+                                <span class="${getConfidenceClass(ic.unit_price)}">${ic.unit_price || 'N/A'}</span> /
+                                <span class="${getConfidenceClass(ic.discount)}">${ic.discount || 'N/A'}</span> /
+                                <span class="${getConfidenceClass(ic.tax)}">${ic.tax || 'N/A'}</span>
+                            </td>
+                        </tr>`;
+                    });
+                    itemsHtml += `</tbody></table>`;
+                    card.querySelector('.card-body').insertAdjacentHTML('beforeend', itemsHtml);
+                }
+                resultsDiv.appendChild(card);
+            }
         }
 
+        function escapeHtml(str) { if(!str) return ''; return str.replace(/[&<>]/g, function(m){if(m==='&') return '&amp;'; if(m==='<') return '&lt;'; if(m==='>') return '&gt;'; return m;}); }
+        function escapeJsString(str) { return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"'); }
+
         async function exportToExcel() {
-            if (!extractionResults) {
+            if (!extractionResults || !extractionResults.results || extractionResults.results.length === 0) {
                 alert('No extraction results to export.');
                 return;
             }
-
-            const exportBtn = document.getElementById('exportBtn');
             exportBtn.disabled = true;
-            exportBtn.textContent = 'Generating Excel...';
-
+            exportBtn.textContent = 'Generating...';
             try {
-                const response = await fetch('/export', {
+                const resp = await fetch('/export', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(extractionResults)
                 });
-
-                if (!response.ok) {
-                    const err = await response.json();
-                    throw new Error(err.error || 'Export failed');
-                }
-
-                const blob = await response.blob();
-                const url = window.URL.createObjectURL(blob);
+                if (!resp.ok) throw new Error((await resp.json()).error || 'Export failed');
+                const blob = await resp.blob();
+                const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
                 a.download = 'extracted_invoices.xlsx';
                 document.body.appendChild(a);
                 a.click();
-                window.URL.revokeObjectURL(url);
-            } catch (error) {
-                alert('Export error: ' + error.message);
+                URL.revokeObjectURL(url);
+            } catch (err) {
+                alert('Export error: ' + err.message);
             } finally {
                 exportBtn.disabled = false;
-                exportBtn.textContent = 'Download Excel Report';
+                exportBtn.textContent = '📥 Download Excel Report';
             }
         }
     </script>

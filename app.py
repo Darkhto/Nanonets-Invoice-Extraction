@@ -23,8 +23,7 @@ app.secret_key = os.environ.get('SECRET_KEY', 'sajbbnffnfkqnjf7qw68767qw62')
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB limit
 
 # --- API Configuration ---
-#NANONETS_API_KEY = os.environ.get('NANONETS_API_KEY')
-NANONETS_API_KEY = os.environ.get('NANONETS_API_KEY')  # Replace with your actual API key
+NANONETS_API_KEY = os.environ.get('NANONETS_API_KEY')
 if not NANONETS_API_KEY:
     raise ValueError("NANONETS_API_KEY environment variable not set")
 
@@ -180,6 +179,9 @@ def poll_and_store_result(job_id, record_id, filename, headers):
                 valid_confs = [c for c in all_confidences if c is not None]
                 avg_confidence = sum(valid_confs) / len(valid_confs) if valid_confs else None
 
+                # Retrieve stored tags for this job
+                tags_list = jobs.get(job_id, {}).get('tags', [])
+
                 jobs[job_id] = {
                     "filename": filename,
                     "status": "completed",
@@ -188,7 +190,8 @@ def poll_and_store_result(job_id, record_id, filename, headers):
                         "extracted_data": extracted,
                         "field_confidences": field_confidences,
                         "line_items_confidences": line_items_conf,
-                        "average_confidence": avg_confidence
+                        "average_confidence": avg_confidence,
+                        "tags": tags_list   # attach tags to result
                     }
                 }
                 return
@@ -232,6 +235,14 @@ def submit_extraction():
         if not files:
             return jsonify({"error": "Empty file list"}), 400
 
+        # Retrieve tags mapping from form data
+        tags_mapping = {}
+        if 'tags_mapping' in request.form:
+            try:
+                tags_mapping = json.loads(request.form['tags_mapping'])
+            except json.JSONDecodeError:
+                logger.warning("Invalid tags_mapping JSON, ignoring")
+
         multipart_data = {
             'output_format': 'json',
             'json_options': json.dumps(EXTRACTION_SCHEMA),
@@ -239,11 +250,17 @@ def submit_extraction():
         }
 
         file_tuples = []
+        file_info = []  # store (original_filename, file_obj, tags)
+
         for f in files:
             if f.filename == '':
                 continue
             filename = secure_filename(f.filename)
-            file_tuples.append(('files', (filename, f.read(), f.content_type)))
+            file_content = f.read()
+            file_tuples.append(('files', (filename, file_content, f.content_type)))
+            # get tags for this filename (original, not secured)
+            tags = tags_mapping.get(f.filename, [])
+            file_info.append((filename, tags))
 
         if not file_tuples:
             return jsonify({"error": "No valid files"}), 400
@@ -263,7 +280,7 @@ def submit_extraction():
         job_ids = []
         for idx, record in enumerate(records):
             record_id = record.get("record_id")
-            original_filename = files[idx].filename if idx < len(files) else record.get("filename", f"file_{idx}.pdf")
+            original_filename, tags = file_info[idx] if idx < len(file_info) else (f"file_{idx}.pdf", [])
 
             if not record_id:
                 continue
@@ -273,7 +290,8 @@ def submit_extraction():
                 "record_id": record_id,
                 "filename": original_filename,
                 "status": "processing",
-                "result": None
+                "result": None,
+                "tags": tags   # store tags
             }
             job_ids.append(job_id)
 
@@ -296,16 +314,19 @@ def get_status(job_id):
 
 @app.route('/results/batch', methods=['POST'])
 def get_batch_results():
-    """Return results for a list of job IDs."""
+    """Return results for a list of job IDs, including tags."""
     data = request.get_json()
     job_ids = data.get('job_ids', [])
     results = []
     for jid in job_ids:
         job = jobs.get(jid)
         if job and job.get('status') == 'completed':
+            # result already contains tags from poll_and_store_result
             results.append(job['result'])
         elif job and job.get('status') == 'failed':
             results.append({"file": job['filename'], "error": job.get('error')})
+        elif job and job.get('status') == 'processing':
+            results.append({"file": job['filename'], "status": "processing"})
     return jsonify({"results": results})
 
 @app.route('/export', methods=['POST'])
@@ -367,6 +388,10 @@ def export_excel():
             raw_payment_term = extracted.get('payment_term', '')
             payment_term, cod_highlight = standardize_payment_term(raw_payment_term)
 
+            # Get tags from result (list of strings)
+            tags_list = invoice.get('tags', [])
+            tags_str = ', '.join(tags_list) if tags_list else ''
+
             first_item = True
             for i, item in enumerate(line_items):
                 if first_item:
@@ -391,12 +416,9 @@ def export_excel():
 
                     ws.cell(row=current_row, column=7).value = ''
                     ws.cell(row=current_row, column=8).value = 'MYR'
-                    ws.cell(row=current_row, column=10).value = 'Non-Interco, Warehouse Picorp'
-
-                    """avg_conf = invoice.get('average_confidence')
-                    cell_avg = ws.cell(row=current_row, column=23)
-                    cell_avg.value = avg_conf
-                    safe_set_fill(cell_avg, get_fill_for_confidence(avg_conf))"""
+                    # Column 10 = Tags
+                    cell_tags = ws.cell(row=current_row, column=10)
+                    cell_tags.value = tags_str
 
                     first_item = False
 
