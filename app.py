@@ -22,8 +22,15 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'sajbbnffnfkqnjf7qw68767qw62')
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB limit
 
+# --- Allowed file extensions ---
+ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg'}
+
+def allowed_file(filename):
+    """Check if file has an allowed extension."""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
 # --- API Configuration ---
-NANONETS_API_KEY = os.environ.get('NANONETS_API_KEY')
+NANONETS_API_KEY = os.environ.get("NANONETS_API_KEY")
 if not NANONETS_API_KEY:
     raise ValueError("NANONETS_API_KEY environment variable not set")
 
@@ -133,7 +140,7 @@ def clean_discount_tax(value):
 
 def poll_and_store_result(job_id, record_id, filename, headers):
     """Background task: poll Nanonets and store result."""
-    max_attempts = 60
+    max_attempts = 120
     interval = 3
     for _ in range(max_attempts):
         try:
@@ -234,6 +241,13 @@ def submit_extraction():
         files = request.files.getlist('files')
         if not files:
             return jsonify({"error": "Empty file list"}), 400
+
+        # Validate all files have allowed extensions
+        for f in files:
+            if f.filename == '':
+                return jsonify({"error": "Empty filename detected"}), 400
+            if not allowed_file(f.filename):
+                return jsonify({"error": f"File type not allowed: {f.filename}. Only PDF, PNG, JPG, JPEG are allowed."}), 400
 
         # Retrieve tags mapping from form data
         tags_mapping = {}
