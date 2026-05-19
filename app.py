@@ -13,6 +13,7 @@ from flask import Flask, request, jsonify, render_template, send_file, session
 from werkzeug.utils import secure_filename
 import openpyxl
 from openpyxl.styles import PatternFill
+from google import genai                          # <-- new package
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -20,19 +21,26 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'sajbbnffnfkqnjf7qw68767qw62')
-app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB limit
+app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
 
 # --- Allowed file extensions ---
 ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg'}
 
 def allowed_file(filename):
-    """Check if file has an allowed extension."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # --- API Configuration ---
 NANONETS_API_KEY = os.environ.get("NANONETS_API_KEY")
 if not NANONETS_API_KEY:
     raise ValueError("NANONETS_API_KEY environment variable not set")
+
+# Google AI (Gemini) – new package
+GOOGLE_AI_API_KEY = os.environ.get("GOOGLE_AI_API_KEY")
+genai_client = None
+if GOOGLE_AI_API_KEY:
+    genai_client = genai.Client(api_key=GOOGLE_AI_API_KEY)
+else:
+    logger.warning("GOOGLE_AI_API_KEY not set – summaries will be empty")
 
 BATCH_ENDPOINT = "https://extraction-api.nanonets.com/api/v1/extract/batch"
 RESULTS_ENDPOINT = "https://extraction-api.nanonets.com/api/v1/extract/results/{}"
@@ -60,14 +68,13 @@ EXTRACTION_SCHEMA = {
     }
 }
 
-# In-memory job store (for single worker)
+# In-memory job store
 jobs = {}
 
 # ------------------------------------------------------------
-# Helper Functions
+# Helper Functions (unchanged)
 # ------------------------------------------------------------
 def standardize_date(date_str):
-    """Convert various date formats to DD/MM/YYYY."""
     if not date_str or not isinstance(date_str, str):
         return ''
     date_str = date_str.strip()
@@ -99,7 +106,6 @@ def standardize_date(date_str):
     return date_str
 
 def standardize_payment_term(term_str):
-    """Convert detected payment term to NETxx or COD with highlight flag."""
     if not term_str or not isinstance(term_str, str):
         return "COD", True
     term_str = term_str.upper()
@@ -112,7 +118,6 @@ def standardize_payment_term(term_str):
     return "COD", True
 
 def to_number(value):
-    """Convert value to float, default 0."""
     if value is None:
         return 0
     if isinstance(value, (int, float)):
@@ -128,7 +133,6 @@ def to_number(value):
     return 0
 
 def clean_discount_tax(value):
-    """Return string value for discount/tax, default '0'."""
     if value is None:
         return "0"
     if isinstance(value, (int, float)):
@@ -139,9 +143,8 @@ def clean_discount_tax(value):
     return "0"
 
 def poll_and_store_result(job_id, record_id, filename, headers):
-    """Background task: poll Nanonets and store result."""
     max_attempts = 120
-    interval = 3
+    interval = 5
     for _ in range(max_attempts):
         try:
             resp = requests.get(
@@ -186,7 +189,6 @@ def poll_and_store_result(job_id, record_id, filename, headers):
                 valid_confs = [c for c in all_confidences if c is not None]
                 avg_confidence = sum(valid_confs) / len(valid_confs) if valid_confs else None
 
-                # Retrieve stored tags for this job
                 tags_list = jobs.get(job_id, {}).get('tags', [])
 
                 jobs[job_id] = {
@@ -198,7 +200,9 @@ def poll_and_store_result(job_id, record_id, filename, headers):
                         "field_confidences": field_confidences,
                         "line_items_confidences": line_items_conf,
                         "average_confidence": avg_confidence,
-                        "tags": tags_list   # attach tags to result
+                        "tags": tags_list,
+                        "summary": None,
+                        "include_summary": True
                     }
                 }
                 return
@@ -221,6 +225,34 @@ def poll_and_store_result(job_id, record_id, filename, headers):
     }
 
 # ------------------------------------------------------------
+# Google AI Summary Helper (unchanged)
+# ------------------------------------------------------------
+def generate_items_summary(line_items):
+    if genai_client is None:
+        return ""
+
+    descriptions = [item.get("description", "").strip() for item in line_items if item.get("description")]
+    if not descriptions:
+        return "No items to summarise."
+
+    items_text = "\n".join(descriptions)
+    prompt = "Give me a quick summary of the invoice for these items. Give me around 15 words sentence.\n\n" + items_text
+
+    try:
+        response = genai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        summary = response.text.strip()
+        words = summary.split()
+        if len(words) > 25:
+            summary = " ".join(words[:25]) + "..."
+        return summary
+    except Exception as e:
+        logger.error(f"AI summary generation failed: {e}")
+        return ""
+
+# ------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------
 @app.route('/')
@@ -233,7 +265,6 @@ def health():
 
 @app.route('/extract', methods=['POST'])
 def submit_extraction():
-    """Submit files to batch endpoint and return job IDs immediately."""
     try:
         if 'files' not in request.files:
             return jsonify({"error": "No files uploaded"}), 400
@@ -242,14 +273,12 @@ def submit_extraction():
         if not files:
             return jsonify({"error": "Empty file list"}), 400
 
-        # Validate all files have allowed extensions
         for f in files:
             if f.filename == '':
                 return jsonify({"error": "Empty filename detected"}), 400
             if not allowed_file(f.filename):
                 return jsonify({"error": f"File type not allowed: {f.filename}. Only PDF, PNG, JPG, JPEG are allowed."}), 400
 
-        # Retrieve tags mapping from form data
         tags_mapping = {}
         if 'tags_mapping' in request.form:
             try:
@@ -264,7 +293,7 @@ def submit_extraction():
         }
 
         file_tuples = []
-        file_info = []  # store (original_filename, file_obj, tags)
+        file_info = []
 
         for f in files:
             if f.filename == '':
@@ -272,7 +301,6 @@ def submit_extraction():
             filename = secure_filename(f.filename)
             file_content = f.read()
             file_tuples.append(('files', (filename, file_content, f.content_type)))
-            # get tags for this filename (original, not secured)
             tags = tags_mapping.get(f.filename, [])
             file_info.append((filename, tags))
 
@@ -285,7 +313,7 @@ def submit_extraction():
             headers=headers,
             files=file_tuples,
             data=multipart_data,
-            timeout=30
+            timeout=100
         )
         batch_resp.raise_for_status()
         batch_data = batch_resp.json()
@@ -305,11 +333,10 @@ def submit_extraction():
                 "filename": original_filename,
                 "status": "processing",
                 "result": None,
-                "tags": tags   # store tags
+                "tags": tags
             }
             job_ids.append(job_id)
 
-            # Start background polling thread
             Thread(target=poll_and_store_result, args=(job_id, record_id, original_filename, headers), daemon=True).start()
 
         return jsonify({"job_ids": job_ids})
@@ -320,7 +347,6 @@ def submit_extraction():
 
 @app.route('/status/<job_id>')
 def get_status(job_id):
-    """Return current status/result of a job."""
     job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
@@ -328,20 +354,36 @@ def get_status(job_id):
 
 @app.route('/results/batch', methods=['POST'])
 def get_batch_results():
-    """Return results for a list of job IDs, including tags."""
     data = request.get_json()
     job_ids = data.get('job_ids', [])
     results = []
     for jid in job_ids:
         job = jobs.get(jid)
         if job and job.get('status') == 'completed':
-            # result already contains tags from poll_and_store_result
             results.append(job['result'])
         elif job and job.get('status') == 'failed':
             results.append({"file": job['filename'], "error": job.get('error')})
         elif job and job.get('status') == 'processing':
             results.append({"file": job['filename'], "status": "processing"})
     return jsonify({"results": results})
+
+# NEW: Generate summaries for existing results
+@app.route('/generate-summaries', methods=['POST'])
+def generate_summaries():
+    try:
+        data = request.get_json()
+        invoices = data.get('results', [])
+        for inv in invoices:
+            if inv.get('error') or inv.get('status') == 'processing':
+                continue
+            line_items = inv.get('extracted_data', {}).get('line_items', [])
+            summary = generate_items_summary(line_items)
+            inv['summary'] = summary
+            inv['include_summary'] = inv.get('include_summary', True)  # keep existing or default
+        return jsonify({"results": invoices})
+    except Exception as e:
+        logger.error(f"Generate summaries failed: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/export', methods=['POST'])
 def export_excel():
@@ -402,9 +444,12 @@ def export_excel():
             raw_payment_term = extracted.get('payment_term', '')
             payment_term, cod_highlight = standardize_payment_term(raw_payment_term)
 
-            # Get tags from result (list of strings)
             tags_list = invoice.get('tags', [])
             tags_str = ', '.join(tags_list) if tags_list else ''
+
+            # Use pre-generated summary and the include flag
+            summary = invoice.get('summary', '')
+            include_summary = invoice.get('include_summary', True)
 
             first_item = True
             for i, item in enumerate(line_items):
@@ -430,9 +475,17 @@ def export_excel():
 
                     ws.cell(row=current_row, column=7).value = ''
                     ws.cell(row=current_row, column=8).value = 'MYR'
-                    # Column 10 = Tags
+
                     cell_tags = ws.cell(row=current_row, column=10)
                     cell_tags.value = tags_str
+
+                    # Only write summary if include_summary is True
+                    if include_summary:
+                        cell_summary = ws.cell(row=current_row, column=11)
+                        cell_summary.value = summary
+                    else:
+                        # Ensure cell is empty if not included
+                        ws.cell(row=current_row, column=11).value = None
 
                     first_item = False
 
@@ -488,9 +541,6 @@ def handle_exception(e):
     logger.error(f"Unhandled exception: {e}", exc_info=True)
     return jsonify({"error": str(e), "type": type(e).__name__}), 500
 
-# ------------------------------------------------------------
-# Main Entry Point
-# ------------------------------------------------------------
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False)

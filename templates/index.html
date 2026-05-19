@@ -23,9 +23,22 @@
         .remove-file-btn { cursor: pointer; color: #dc3545; font-weight: bold; background: none; border: none; }
         .remove-file-btn:hover { text-decoration: underline; }
         .file-thumbnail { height: 40px; width: auto; border-radius: 4px; object-fit: cover; background: #e9ecef; }
+        .ai-summary { font-style: italic; color: #6c757d; }
+        /* Toast styling */
+        .toast-container { position: fixed; top: 20px; right: 20px; z-index: 9999; }
     </style>
 </head>
 <body>
+    <!-- Toast container for notifications -->
+    <div class="toast-container" id="toastContainer">
+        <div class="toast align-items-center text-white bg-success border-0" id="liveToast" role="alert" aria-live="assertive" aria-atomic="true">
+            <div class="d-flex">
+                <div class="toast-body" id="toastMessage"></div>
+                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+            </div>
+        </div>
+    </div>
+
     <div class="container py-4">
         <div class="card">
             <div class="card-header">
@@ -35,7 +48,7 @@
                 <p class="lead">Upload PDF or image invoices → extract data → automatically assign <strong>"Non-Interco"</strong> and <strong>"Warehouse Picorp"</strong> to every invoice.</p>
 
                 <div class="alert alert-info">
-                    <strong>How it works:</strong> After extraction, each invoice card will already show the two default tags. You can click <strong>"Select Tags"</strong> to add more tags or remove the defaults. The Excel export includes all tags you've saved.
+                    <strong>How it works:</strong> After extraction, each invoice card will already show the two default tags. You can click <strong>"Select Tags"</strong> to add more tags or remove the defaults. Use <strong>"Generate AI Descriptions"</strong> to get a short summary for the Excel export.
                 </div>
 
                 <div class="mb-3">
@@ -43,14 +56,14 @@
                     <input class="form-control" type="file" id="fileInput" multiple accept=".pdf,image/png,image/jpeg,image/jpg">
                 </div>
 
-                <!-- Selected files preview with thumbnails -->
                 <div id="selectedFilesContainer" class="mb-3" style="display: none;">
                     <h5>Selected Files</h5>
                     <div id="selectedFilesList"></div>
                 </div>
 
-                <div class="d-flex gap-2">
+                <div class="d-flex gap-2 mb-3">
                     <button class="btn btn-primary" id="extractBtn" onclick="uploadFiles()">🚀 Extract Data</button>
+                    <button id="genDescBtn" class="btn btn-info" onclick="generateDescriptions()" style="display: none;">🤖 Generate AI Descriptions</button>
                     <button id="exportBtn" class="btn btn-success" onclick="exportToExcel()" style="display: none;">📥 Download Excel Report</button>
                 </div>
 
@@ -82,7 +95,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        // ======================= TAG DATA STRUCTURE =======================
         const tagCategories = {
             "Budgeting": ["CAPX", "CEKI", "CEOO", "FACI", "FINC", "HURE", "INGD", "LOGT", "MKTG", "OPES", "OPSP", "PROC", "RNDV", "RPMN", "RTUT", "SLRS", "TECH", "TRAI", "WARE"],
             "Chicken Tenders": ["Zenders"],
@@ -98,7 +110,6 @@
             "Seksyen 6": ["CK Seksyen 6"]
         };
 
-        // Global storage for extraction results
         let extractionResults = null;
 
         function getResultIndexByFilename(filename) {
@@ -109,23 +120,33 @@
             return -1;
         }
 
-        // Modal state
         let currentModalFile = null;
         let currentTempTags = [];
 
-        // DOM elements
         const fileInput = document.getElementById('fileInput');
         const selectedFilesContainer = document.getElementById('selectedFilesContainer');
         const selectedFilesList = document.getElementById('selectedFilesList');
         const statusDiv = document.getElementById('status');
         const resultsDiv = document.getElementById('results');
         const exportBtn = document.getElementById('exportBtn');
+        const genDescBtn = document.getElementById('genDescBtn');
         const tagModal = new bootstrap.Modal(document.getElementById('tagModal'));
         const tagCheckboxesDiv = document.getElementById('tagCheckboxes');
         const saveTagsBtn = document.getElementById('saveTagsBtn');
         const modalFileNameSpan = document.getElementById('modalFileName');
 
-        // Helper: create object URL for thumbnail and revoke later
+        // Toast initialization
+        const toastEl = document.getElementById('liveToast');
+        const toast = bootstrap.Toast.getOrCreateInstance(toastEl);
+        const toastMessage = document.getElementById('toastMessage');
+
+        function showToast(message, type = 'success') {
+            toastMessage.textContent = message;
+            // Change background class based on type
+            toastEl.className = `toast align-items-center text-white bg-${type} border-0`;
+            toast.show();
+        }
+
         function updateSelectedFilesPreview() {
             const files = Array.from(fileInput.files);
             if (files.length === 0) {
@@ -164,7 +185,6 @@
 
         fileInput.addEventListener('change', updateSelectedFilesPreview);
 
-        // Render checkboxes for modal, pre-selecting any tags currently stored for the file
         function renderTagModalCheckboxes(selectedTags) {
             tagCheckboxesDiv.innerHTML = '';
             for (const [category, subs] of Object.entries(tagCategories)) {
@@ -225,7 +245,6 @@
             tagModal.hide();
         };
 
-        // =============== Extraction and Polling ===============
         async function uploadFiles() {
             const files = fileInput.files;
             if (files.length === 0) {
@@ -236,6 +255,7 @@
             statusDiv.innerHTML = '<div class="alert alert-info">Submitting files...</div>';
             resultsDiv.innerHTML = '';
             exportBtn.style.display = 'none';
+            genDescBtn.style.display = 'none';
             extractionResults = null;
 
             const formData = new FormData();
@@ -277,16 +297,18 @@
 
                     if (completedCount === jobIds.length) {
                         allDone = true;
-                        // Auto-populate default tags for each result
                         for (let res of statusData.results) {
                             if (!res.error && res.status !== 'processing') {
                                 res.tags = ['Non-Interco', 'Warehouse Picorp'];
+                                res.summary = res.summary || null;
+                                res.include_summary = res.include_summary !== undefined ? res.include_summary : true;
                             }
                         }
                         extractionResults = statusData;
                         displayResults(extractionResults.results);
                         exportBtn.style.display = 'inline-block';
-                        statusDiv.innerHTML = `<div class="alert alert-success">✅ Completed processing ${completedCount} file(s). Default tags (Non-Interco, Warehouse Picorp) have been auto-assigned. You can edit tags by clicking "Select Tags".</div>`;
+                        genDescBtn.style.display = 'inline-block';
+                        statusDiv.innerHTML = `<div class="alert alert-success">✅ Completed processing ${completedCount} file(s). Default tags auto-assigned.</div>`;
                     }
                 }
                 if (!allDone) throw new Error('Processing timed out.');
@@ -328,6 +350,8 @@
                 const avgClass = getConfidenceClass(avgConf);
                 const tags = result.tags || [];
                 const tagsHtml = tags.map(t => `<span class="tag-badge">${escapeHtml(t)}</span>`).join('') || '<span class="text-muted small">No tags assigned</span>';
+                const summaryText = result.summary || '';
+                const includeChecked = result.include_summary ? 'checked' : '';
 
                 const card = document.createElement('div');
                 card.className = 'card mt-3';
@@ -345,6 +369,11 @@
                             <tr><th>Payment Term</th><td>${escapeHtml(data.payment_term || '')}</td><td class="${getConfidenceClass(result.field_confidences.payment_term)}">${result.field_confidences.payment_term || 'N/A'}</td></tr>
                         </table>
                         <div class="result-tags"><strong>Tags:</strong> <span id="tags-${escapeHtml(result.file.replace(/[^a-zA-Z0-9]/g, '_'))}">${tagsHtml}</span></div>
+                        ${summaryText ? `<div class="mt-2"><strong>AI Summary:</strong> <span class="ai-summary">${escapeHtml(summaryText)}</span></div>` : ''}
+                        <div class="form-check mt-2">
+                            <input class="form-check-input include-summary-check" type="checkbox" id="inc-${escapeHtml(result.file.replace(/[^a-zA-Z0-9]/g, '_'))}" data-filename="${escapeHtml(result.file)}" ${includeChecked}>
+                            <label class="form-check-label" for="inc-${escapeHtml(result.file.replace(/[^a-zA-Z0-9]/g, '_'))}">Include AI description in export</label>
+                        </div>
                 `;
 
                 if (data.line_items && data.line_items.length) {
@@ -370,6 +399,46 @@
                     card.querySelector('.card-body').insertAdjacentHTML('beforeend', itemsHtml);
                 }
                 resultsDiv.appendChild(card);
+            }
+
+            document.querySelectorAll('.include-summary-check').forEach(cb => {
+                cb.addEventListener('change', function() {
+                    const filename = this.getAttribute('data-filename');
+                    const idx = getResultIndexByFilename(filename);
+                    if (idx !== -1) {
+                        extractionResults.results[idx].include_summary = this.checked;
+                    }
+                });
+            });
+        }
+
+        async function generateDescriptions() {
+            if (!extractionResults || !extractionResults.results || extractionResults.results.length === 0) {
+                alert('No extraction results to generate descriptions for.');
+                return;
+            }
+            genDescBtn.disabled = true;
+            genDescBtn.textContent = 'Generating...';
+            try {
+                const resp = await fetch('/generate-summaries', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(extractionResults)
+                });
+                if (!resp.ok) throw new Error((await resp.json()).error || 'Generation failed');
+                const updatedData = await resp.json();
+                extractionResults.results = updatedData.results;
+                displayResults(extractionResults.results);
+                // Show toast notification
+                showToast('✅ AI descriptions generated for all invoices!', 'success');
+                // Also update status message as fallback
+                statusDiv.innerHTML = '<div class="alert alert-success">✅ AI descriptions generated for all invoices.</div>';
+            } catch (err) {
+                showToast('❌ Error: ' + err.message, 'danger');
+                statusDiv.innerHTML = `<div class="alert alert-danger">Error: ${err.message}</div>`;
+            } finally {
+                genDescBtn.disabled = false;
+                genDescBtn.textContent = '🤖 Generate AI Descriptions';
             }
         }
 
