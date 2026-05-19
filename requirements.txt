@@ -9,13 +9,13 @@ cryptography==48.0.0
 distro==1.9.0
 et_xmlfile==2.0.0
 Flask==3.1.1
-google-ai-generativelanguage==0.6.15
-google-api-core==2.30.3
+google-ai-generativelanguage
+google-api-core
 google-api-python-client==2.196.0
 google-auth==2.53.0
 google-auth-httplib2==0.4.0
 google-genai==2.4.0
-googleapis-common-protos==1.75.0
+googleapis-common-protos
 grpcio==1.80.0
 grpcio-status
 gunicorn==20.1.0
@@ -28,8 +28,8 @@ itsdangerous==2.2.0
 Jinja2==3.1.6
 MarkupSafe==3.0.3
 openpyxl==3.1.2
-proto-plus==1.28.0
-protobuf==4.25.9
+proto-plus
+protobuf
 pyasn1==0.6.3
 pyasn1_modules==0.4.2
 pycparser==3.0
