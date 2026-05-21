@@ -236,7 +236,7 @@ def generate_items_summary(line_items):
         return "No items to summarise."
 
     items_text = "\n".join(descriptions)
-    prompt = "Give me a quick summary of the invoice for these items. Give me around 15 words sentence.\n\n" + items_text
+    prompt = "Summarize this pizza shop invoice in one short sentence (about 10 words), categorizing items by purpose such as pizza ingredients, drinks, utensils, packaging, cleaning supplies, or other shop essentials. Do not include “Invoice summary.” \n\n" + items_text
 
     try:
         response = genai_client.models.generate_content(
