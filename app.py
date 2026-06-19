@@ -14,6 +14,7 @@ from werkzeug.utils import secure_filename
 import openpyxl
 from openpyxl.styles import PatternFill
 from google import genai                          # <-- new package
+from invoice_filter import filter_invoice_pages   # keep only invoice pages
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -300,6 +301,26 @@ def submit_extraction():
                 continue
             filename = secure_filename(f.filename)
             file_content = f.read()
+
+            # Keep only the invoice page(s) before sending to Nanonets. The
+            # uploaded file is a merged pack (Invoice + PR + GRN) and Nanonets
+            # would otherwise pick the PR/GRN number or mix in their line
+            # items. Filtering down to the invoice page fixes both problems.
+            try:
+                file_content, filter_info = filter_invoice_pages(
+                    file_content, filename=filename, genai_client=genai_client
+                )
+                logger.info(
+                    f"Invoice page filter [{filename}]: {filter_info['reason']} "
+                    f"| labels={filter_info['labels']} "
+                    f"| kept={filter_info['kept_pages']}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Invoice page filtering failed for {filename}: {e}; "
+                    f"sending original file unchanged"
+                )
+
             file_tuples.append(('files', (filename, file_content, f.content_type)))
             tags = tags_mapping.get(f.filename, [])
             file_info.append((filename, tags))
